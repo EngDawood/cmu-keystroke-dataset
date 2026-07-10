@@ -10,8 +10,7 @@ For each of the 51 subjects:
   - Impostor: first 5 repetitions of each of the other 50 subjects (250).
   - EER:      point where the false-accept rate equals the false-reject rate.
 
-Detectors: scaled Manhattan (primary, from keystroke_model), Mahalanobis
-nearest-neighbour, plain Manhattan, Euclidean.
+Run with:  uv run train.py
 
 Outputs: results/results_summary.csv, results/roc_scaled_manhattan.png,
 results/confusion_matrix.png, and a printed summary table.
@@ -26,51 +25,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_curve
 
-import keystroke_model
+from keystroke_dynamics import DETECTORS, compute_eer
 
-CSV_PATH = "DSL-StrongPasswordData.csv"
+CSV_PATH = os.path.join("data", "DSL-StrongPasswordData.csv")
 RESULTS_DIR = "results"
 
 N_TRAIN = 200        # first 200 repetitions -> enrollment
 N_IMPOSTOR_REPS = 5  # first 5 repetitions of every other subject
-
-
-# --------------------------------------------------------------------------
-# Detectors: each takes the training matrix and a test matrix and returns one
-# anomaly score per test row (lower = more genuine).
-# --------------------------------------------------------------------------
-
-def scaled_manhattan_scores(train: np.ndarray, test: np.ndarray) -> np.ndarray:
-    profile = keystroke_model.build_profile(train)
-    return np.array([keystroke_model.score(profile, x) for x in test])
-
-
-def manhattan_scores(train: np.ndarray, test: np.ndarray) -> np.ndarray:
-    mean = train.mean(axis=0)
-    return np.abs(test - mean).sum(axis=1)
-
-
-def euclidean_scores(train: np.ndarray, test: np.ndarray) -> np.ndarray:
-    mean = train.mean(axis=0)
-    return np.sqrt(((test - mean) ** 2).sum(axis=1))
-
-
-def nearest_neighbor_mahalanobis_scores(train: np.ndarray,
-                                        test: np.ndarray) -> np.ndarray:
-    # Score = Mahalanobis distance to the nearest training sample (k=1),
-    # using the covariance of the training data (Killourhy & Maxion, 2009).
-    cov_inv = np.linalg.pinv(np.cov(train, rowvar=False))
-    diffs = test[:, None, :] - train[None, :, :]          # (n_test, n_train, d)
-    d2 = np.einsum("ijk,kl,ijl->ij", diffs, cov_inv, diffs)
-    return np.sqrt(np.maximum(d2.min(axis=1), 0.0))
-
-
-DETECTORS = {
-    "Scaled Manhattan": scaled_manhattan_scores,
-    "Nearest Neighbor (Mahalanobis)": nearest_neighbor_mahalanobis_scores,
-    "Manhattan": manhattan_scores,
-    "Euclidean": euclidean_scores,
-}
 
 # Published mean EERs from Killourhy & Maxion (2009), for the sanity check.
 EXPECTED_EER = {
@@ -81,49 +42,67 @@ EXPECTED_EER = {
 }
 
 
-def compute_eer(genuine_scores: np.ndarray, impostor_scores: np.ndarray):
-    """EER of one subject, plus the score threshold at which it occurs.
+def load_dataset(csv_path: str):
+    """Return {subject: feature matrix ordered by (sessionIndex, rep)}."""
+    df = pd.read_csv(csv_path)
+    feature_cols = df.columns[3:]  # the 31 timing features
+    assert len(feature_cols) == 31, f"expected 31 features, got {len(feature_cols)}"
+    # Rows are already ordered by (sessionIndex, rep) within each subject;
+    # sort defensively so "first 200" / "last 200" match the protocol.
+    df = df.sort_values(["subject", "sessionIndex", "rep"]).reset_index(drop=True)
+    subjects = sorted(df["subject"].unique())
+    data = {s: df.loc[df["subject"] == s, feature_cols].to_numpy(dtype=float)
+            for s in subjects}
+    print(f"Loaded {len(df)} rows, {len(subjects)} subjects, "
+          f"{len(feature_cols)} timing features.\n")
+    return subjects, data
 
-    Scores are anomaly scores (lower = genuine), so the ROC is computed on
-    negated scores with genuine as the positive class.  The EER is found by
-    linear interpolation between the two ROC points where FAR - FRR changes
-    sign.
-    """
-    y_true = np.concatenate([np.ones_like(genuine_scores),
-                             np.zeros_like(impostor_scores)])
-    y_score = -np.concatenate([genuine_scores, impostor_scores])
-    far, tpr, thresholds = roc_curve(y_true, y_score)
-    frr = 1.0 - tpr
 
-    diff = far - frr
-    idx = np.argmax(diff >= 0)  # first point where FAR >= FRR
-    if diff[idx] == 0 or idx == 0:
-        eer = far[idx]
-        thr = -thresholds[idx]
-    else:
-        # Interpolate between points idx-1 (FAR < FRR) and idx (FAR > FRR).
-        x0, x1 = diff[idx - 1], diff[idx]
-        w = -x0 / (x1 - x0)
-        eer = far[idx - 1] + w * (far[idx] - far[idx - 1])
-        thr = -(thresholds[idx - 1] + w * (thresholds[idx] - thresholds[idx - 1]))
-    return float(eer), float(thr)
+def plot_roc(genuine: np.ndarray, impostor: np.ndarray, mean_eer: float,
+             path: str):
+    """Pooled ROC curve for the scaled Manhattan detector."""
+    y_true = np.concatenate([np.ones_like(genuine), np.zeros_like(impostor)])
+    far, tpr, _ = roc_curve(y_true, -np.concatenate([genuine, impostor]))
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(far, tpr, color="tab:blue",
+             label="Scaled Manhattan (pooled over 51 subjects)")
+    plt.plot([0, 1], [0, 1], "--", color="gray", linewidth=1, label="Chance")
+    plt.xlabel("False Accept Rate (FAR)")
+    plt.ylabel("Genuine Accept Rate (1 − FRR)")
+    plt.title(f"ROC — Scaled Manhattan detector\n"
+              f"mean per-subject EER = {mean_eer:.3f}")
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_confusion(confusion: np.ndarray, path: str):
+    """Genuine/impostor confusion matrix at the per-subject EER thresholds."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.imshow(confusion, cmap="Blues")
+    ax.set_xticks([0, 1], ["Accepted\n(genuine)", "Rejected\n(impostor)"])
+    ax.set_yticks([0, 1], ["Genuine", "Impostor"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title("Confusion matrix — Scaled Manhattan\n"
+                 "(per-subject EER threshold, pooled over 51 subjects)")
+    for r in range(2):
+        for c in range(2):
+            frac = confusion[r, c] / confusion[r].sum()
+            ax.text(c, r, f"{confusion[r, c]}\n({frac:.1%})",
+                    ha="center", va="center",
+                    color="white" if confusion[r, c] > confusion.max() / 2 else "black")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
 
 
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
-
-    df = pd.read_csv(CSV_PATH)
-    feature_cols = df.columns[3:]  # the 31 timing features
-    assert len(feature_cols) == 31, f"expected 31 features, got {len(feature_cols)}"
-    subjects = sorted(df["subject"].unique())
-    print(f"Loaded {len(df)} rows, {len(subjects)} subjects, "
-          f"{len(feature_cols)} timing features.\n")
-
-    # Rows are already ordered by (sessionIndex, rep) within each subject;
-    # sort defensively so "first 200" / "last 200" match the protocol.
-    df = df.sort_values(["subject", "sessionIndex", "rep"]).reset_index(drop=True)
-    data = {s: df.loc[df["subject"] == s, feature_cols].to_numpy(dtype=float)
-            for s in subjects}
+    subjects, data = load_dataset(CSV_PATH)
 
     per_subject_eer = {name: [] for name in DETECTORS}
     # Extra collections for the scaled-Manhattan plots.
@@ -156,49 +135,15 @@ def main():
     # ---------------- results CSV ----------------
     summary = pd.DataFrame({"subject": subjects})
     for name in DETECTORS:
-        summary[f"eer_{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}"] = \
-            per_subject_eer[name]
+        col = "eer_" + name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        summary[col] = per_subject_eer[name]
     summary.to_csv(os.path.join(RESULTS_DIR, "results_summary.csv"), index=False)
 
-    # ---------------- ROC curve (pooled, scaled Manhattan) ----------------
-    g = np.concatenate(pooled_genuine)
-    i = np.concatenate(pooled_impostor)
-    y_true = np.concatenate([np.ones_like(g), np.zeros_like(i)])
-    far, tpr, _ = roc_curve(y_true, -np.concatenate([g, i]))
+    # ---------------- plots (scaled Manhattan) ----------------
     mean_eer_sm = float(np.mean(per_subject_eer["Scaled Manhattan"]))
-
-    plt.figure(figsize=(6, 6))
-    plt.plot(far, tpr, color="tab:blue",
-             label="Scaled Manhattan (pooled over 51 subjects)")
-    plt.plot([0, 1], [0, 1], "--", color="gray", linewidth=1, label="Chance")
-    plt.xlabel("False Accept Rate (FAR)")
-    plt.ylabel("Genuine Accept Rate (1 − FRR)")
-    plt.title(f"ROC — Scaled Manhattan detector\n"
-              f"mean per-subject EER = {mean_eer_sm:.3f}")
-    plt.legend(loc="lower right")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "roc_scaled_manhattan.png"), dpi=150)
-    plt.close()
-
-    # ---------------- confusion matrix (EER threshold) ----------------
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.imshow(confusion, cmap="Blues")
-    ax.set_xticks([0, 1], ["Accepted\n(genuine)", "Rejected\n(impostor)"])
-    ax.set_yticks([0, 1], ["Genuine", "Impostor"])
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    ax.set_title("Confusion matrix — Scaled Manhattan\n"
-                 "(per-subject EER threshold, pooled over 51 subjects)")
-    for r in range(2):
-        for c in range(2):
-            frac = confusion[r, c] / confusion[r].sum()
-            ax.text(c, r, f"{confusion[r, c]}\n({frac:.1%})",
-                    ha="center", va="center",
-                    color="white" if confusion[r, c] > confusion.max() / 2 else "black")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "confusion_matrix.png"), dpi=150)
-    plt.close()
+    plot_roc(np.concatenate(pooled_genuine), np.concatenate(pooled_impostor),
+             mean_eer_sm, os.path.join(RESULTS_DIR, "roc_scaled_manhattan.png"))
+    plot_confusion(confusion, os.path.join(RESULTS_DIR, "confusion_matrix.png"))
 
     # ---------------- summary table ----------------
     print(f"{'Detector':<34}{'Mean EER':>10}{'Std':>8}{'Expected':>10}")
