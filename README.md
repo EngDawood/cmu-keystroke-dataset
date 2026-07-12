@@ -14,6 +14,7 @@ src/keystroke_dynamics/      installable package
     detectors.py             all four benchmark detectors
     evaluation.py            EER computation
 train.py                     benchmark evaluation script
+notebooks/                   interactive walkthrough covering the full pipeline
 results/                     results_summary.csv + ROC + confusion matrix
 ```
 
@@ -25,6 +26,23 @@ Requires [uv](https://docs.astral.sh/uv/):
 uv sync          # create the environment and install dependencies
 uv run train.py  # run the full benchmark
 ```
+
+## Notebook walkthrough
+
+`notebooks/keystroke_dynamics_walkthrough.ipynb` covers the whole pipeline interactively:
+downloading the dataset, exploring the features, the scaled-Manhattan matcher, all four
+detectors, EER computation, the full benchmark loop, results, and plots.
+
+Run locally:
+
+```bash
+uv run jupyter notebook notebooks/keystroke_dynamics_walkthrough.ipynb
+```
+
+Or open directly in Google Colab (the first cell clones this repo and installs
+dependencies automatically):
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/EngDawood/cmu-keystroke-dataset/blob/main/notebooks/keystroke_dynamics_walkthrough.ipynb)
 
 ## Results (mean EER ± std over 51 subjects)
 
